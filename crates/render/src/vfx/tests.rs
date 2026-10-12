@@ -118,6 +118,7 @@ const NEW_IDS: &[&str] = &[
     "stroke",
     "metadata_burnin",
     "echo",
+    "motion_extract",
     "lightning",
     "cell_pattern",
     "checkerboard",
@@ -1069,6 +1070,251 @@ fn auto_reframe_follows_the_subject() {
     assert_eq!(img.px, raw.px);
 }
 
+// ------------------------------------------------------------------ Motion Extract
+
+use temporal::{ExtractMode, ExtractParams};
+
+fn mx(mode: ExtractMode) -> ExtractParams {
+    ExtractParams { delay: 4, mode, gain: 1.0, black: 0.0, palette: 0, base_dim: 0.85 }
+}
+
+/// `w`×`h` black with hard-edged discs `(centre x, centre y, radius, display-encoded value)`.
+fn discs(w: usize, h: usize, list: &[(f32, f32, f32, f32)]) -> Image {
+    let mut img = Image::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let mut v = 0.0;
+            for &(px, py, r, value) in list {
+                if in_disc(x, y, (px, py, r)) {
+                    v = value;
+                }
+            }
+            let l = dec([v; 3]);
+            img.px[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[l[0], l[1], l[2], 1.0]);
+        }
+    }
+    img
+}
+fn in_disc(x: usize, y: usize, (px, py, r): (f32, f32, f32)) -> bool {
+    let (dx, dy) = (x as f32 + 0.5 - px, y as f32 + 0.5 - py);
+    dx * dx + dy * dy <= r * r
+}
+fn extract(now: &Image, past: &Image, p: &ExtractParams) -> Image {
+    let mut o = now.clone();
+    temporal::extract_motion(&mut o, Some(past), p);
+    o
+}
+
+#[test]
+fn motion_extract_static_picture_gives_mid_grey_or_black() {
+    let still = picture(48, 32);
+    // Classic: whatever the picture, nothing moved, so every channel is 0.5 (display-encoded)
+    for past in [Some(&still), None] {
+        let mut o = still.clone();
+        temporal::extract_motion(&mut o, past, &mx(ExtractMode::Classic));
+        for y in 0..o.h {
+            for x in 0..o.w {
+                let c = enc_px(&o, x, y);
+                assert!(c[..3].iter().all(|v| close(*v, 0.5, 1e-4)) && c[3] == 1.0, "({x},{y}) {c:?}");
+            }
+        }
+    }
+    // Reveal with the picture fully dimmed: black
+    let black = extract(&still, &still, &ExtractParams { base_dim: 1.0, ..mx(ExtractMode::Reveal) });
+    assert!(black.px.as_chunks::<4>().0.iter().all(|p| p[..3].iter().all(|v| v.abs() <= 1e-6) && p[3] == 1.0));
+    // Reveal at the default dimming: a 15 % copy of the picture under no motion
+    let dim = extract(&still, &still, &mx(ExtractMode::Reveal));
+    for (x, y) in [(0, 0), (11, 7), (30, 20), (47, 31)] {
+        let (a, b) = (enc_px(&dim, x, y), enc_px(&still, x, y));
+        assert!((0..3).all(|k| close(a[k], b[k] * 0.15, 1e-4)), "({x},{y}) {a:?} vs {b:?}");
+    }
+}
+
+#[test]
+fn motion_extract_a_moving_disc_lights_its_new_and_old_places() {
+    let (w, h) = (64, 40);
+    let (a, b, still) = ((40.0, 20.0, 4.0), (24.0, 20.0, 4.0), (10.0, 30.0, 5.0));
+    let now = discs(w, h, &[(a.0, a.1, a.2, 1.0), (still.0, still.1, still.2, 0.8)]);
+    let past = discs(w, h, &[(b.0, b.1, b.2, 1.0), (still.0, still.1, still.2, 0.8)]);
+    // Classic: white where the disc is, black where it was, mid-grey everywhere else (the still disc too)
+    let o = extract(&now, &past, &mx(ExtractMode::Classic));
+    let (mut at_a, mut at_b, mut lit) = (0, 0, 0);
+    for y in 0..h {
+        for x in 0..w {
+            let want = if in_disc(x, y, a) {
+                at_a += 1;
+                1.0
+            } else if in_disc(x, y, b) {
+                at_b += 1;
+                0.0
+            } else {
+                0.5
+            };
+            let c = enc_px(&o, x, y);
+            assert!(c[..3].iter().all(|v| close(*v, want, 1e-4)), "({x},{y}) want {want}, got {c:?}");
+            lit += usize::from((c[0] - 0.5).abs() > 1e-3);
+        }
+    }
+    assert!(at_a > 20 && at_a == at_b && lit == at_a + at_b, "{at_a} {at_b} {lit}");
+    // Reveal, picture fully dimmed, Mono: white at both places (the change is |now - past|), black elsewhere
+    let r = extract(&now, &past, &ExtractParams { base_dim: 1.0, ..mx(ExtractMode::Reveal) });
+    for y in 0..h {
+        for x in 0..w {
+            let want = if in_disc(x, y, a) || in_disc(x, y, b) { 1.0 } else { 0.0 };
+            let c = enc_px(&r, x, y);
+            assert!(c[..3].iter().all(|v| close(*v, want, 1e-4)), "reveal ({x},{y}) want {want}, got {c:?}");
+        }
+    }
+    // Reveal at the default dimming keeps the picture under the quiet places: the still disc at 15 %
+    let d = extract(&now, &past, &mx(ExtractMode::Reveal));
+    assert!(close(enc_px(&d, 10, 30)[0], 0.8 * 0.15, 1e-4) && close(enc_px(&d, 2, 2)[0], 0.0, 1e-5));
+}
+
+#[test]
+fn motion_extract_gain_scales_the_change_linearly() {
+    let (w, h) = (64, 40);
+    let now = discs(w, h, &[(40.0, 20.0, 4.0, 0.3)]);
+    let past = discs(w, h, &[(24.0, 20.0, 4.0, 0.3)]);
+    // Classic: the deviation from mid-grey is gain × 0.5 × the change (0.3), up and down
+    let dev = |gain: f32, x: usize, y: usize| enc_px(&extract(&now, &past, &ExtractParams { gain, ..mx(ExtractMode::Classic) }), x, y)[1] - 0.5;
+    let unit = dev(1.0, 40, 20);
+    assert!(close(unit, 0.15, 1e-4) && close(dev(1.0, 24, 20), -0.15, 1e-4), "{unit}");
+    for g in [0.1, 0.5, 2.0, 3.0] {
+        assert!(close(dev(g, 40, 20), g * unit, 1e-4), "gain {g}: {} vs {}", dev(g, 40, 20), g * unit);
+        assert!(close(dev(g, 24, 20), -g * unit, 1e-4), "gain {g} (old place)");
+    }
+    // Reveal: the amount (before the ramp) is linear in gain until it clips at 1
+    let amount = |gain: f32, diff: f32| temporal::motion_amount(diff, &ExtractParams { gain, ..mx(ExtractMode::Reveal) });
+    assert!(close(amount(1.0, 0.2), 0.2, 1e-6));
+    for g in [0.5, 2.0, 4.0] {
+        assert!(close(amount(g, 0.2), g * amount(1.0, 0.2), 1e-6), "gain {g}");
+    }
+    assert_eq!(amount(8.0, 0.2), 1.0);
+    assert_eq!(amount(2.0, -0.2), amount(2.0, 0.2), "the sign of the change does not matter");
+}
+
+#[test]
+fn motion_extract_black_level_is_a_dead_zone() {
+    let (w, h) = (64, 40);
+    let past = discs(w, h, &[]);
+    let p = ExtractParams { black: 0.2, ..mx(ExtractMode::Classic) };
+    let at = |v: f32| enc_px(&extract(&discs(w, h, &[(40.0, 20.0, 4.0, v)]), &past, &p), 40, 20)[0];
+    assert!(close(at(0.15), 0.5, 1e-4), "below the dead zone: {}", at(0.15));
+    assert!(close(at(0.5), 0.5 + 0.5 * 0.375, 1e-4), "(0.5 - 0.2) / 0.8 of the change: {}", at(0.5));
+    assert!(close(at(1.0), 1.0, 1e-4), "a full-scale change stays full scale: {}", at(1.0));
+    let r = ExtractParams { black: 0.2, ..mx(ExtractMode::Reveal) };
+    assert_eq!(temporal::motion_amount(0.15, &r), 0.0);
+    assert!(close(temporal::motion_amount(0.5, &r), 0.375, 1e-6) && close(temporal::motion_amount(1.0, &r), 1.0, 1e-6));
+}
+
+#[test]
+fn motion_extract_palettes_are_the_demo_ramps() {
+    // the grid demo's PALS (Sorbet, Lagoon, Peach fuzz), copied from grid-demo/index.html
+    let demo: [[&str; 5]; 3] = [
+        ["#2c2745", "#6d5fa8", "#e49bc4", "#ffc9a8", "#fff5cf"],
+        ["#17323f", "#3c8793", "#86d3bf", "#cdeeb0", "#fff7d8"],
+        ["#3a2c3b", "#9b5f8e", "#f09aa0", "#ffd09a", "#fffae8"],
+    ];
+    let rgb = |s: &str| [1, 3, 5].map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap() as f32 / 255.0);
+    for (i, stops) in demo.iter().enumerate() {
+        for (k, hex) in stops.iter().enumerate() {
+            let got = temporal::ramp_color(i as u32 + 1, k as f32 / 4.0);
+            assert!(got.iter().zip(rgb(hex)).all(|(g, w)| close(*g, w, 1e-5)), "pastel {} stop {k}: {got:?} vs {hex}", i + 1);
+        }
+        let y: Vec<f32> = (0..=8).map(|k| luma(temporal::ramp_color(i as u32 + 1, k as f32 / 8.0))).collect();
+        assert!(y.windows(2).all(|p| p[1] > p[0]), "pastel {} gets lighter along the ramp: {y:?}", i + 1);
+    }
+    // Mono (MotionScope): black, a cool grey at 0.45, white; positions off the ramp stay on its ends
+    assert_eq!(temporal::ramp_color(0, 0.0), [0.0; 3]);
+    assert!(temporal::ramp_color(0, 0.45).iter().zip([0.55, 0.57, 0.62]).all(|(g, w)| close(*g, w, 1e-6)));
+    let white = |c: [f32; 3]| c.iter().all(|v| close(*v, 1.0, 1e-6));
+    assert!(white(temporal::ramp_color(0, 1.0)) && white(temporal::ramp_color(0, 7.0)));
+    assert_eq!(temporal::ramp_color(0, f32::NAN), [0.0; 3]);
+    assert!(white(temporal::ramp_color(99, 1.0)), "an unknown palette is Mono");
+    // Reveal in Pastel 1 at full signal ends on the cream end of the ramp
+    let (w, h) = (64, 40);
+    let r = extract(&discs(w, h, &[(40.0, 20.0, 4.0, 1.0)]), &discs(w, h, &[]), &ExtractParams { palette: 1, base_dim: 1.0, ..mx(ExtractMode::Reveal) });
+    let c = enc_px(&r, 40, 20);
+    assert!((0..3).all(|k| close(c[k], rgb("#fff5cf")[k], 1e-4)), "{c:?}");
+    // Classic in Pastel 1: nothing moved is the middle stop
+    let still = discs(w, h, &[(10.0, 10.0, 3.0, 0.6)]);
+    let c = enc_px(&extract(&still, &still, &ExtractParams { palette: 1, ..mx(ExtractMode::Classic) }), 30, 30);
+    assert!((0..3).all(|k| close(c[k], rgb("#e49bc4")[k], 1e-4)), "{c:?}");
+}
+
+/// A clip with a white bar moving right at 100 px/s over black (2 s, 24 fps).
+fn bar_env(now: f64) -> ClipEnv {
+    fn moving(x: f64, _y: f64, t: f64) -> [f32; 3] {
+        let v = if (x - t * 100.0).abs() < 4.0 { 1.0 } else { 0.0 };
+        [v, v, v]
+    }
+    ClipEnv { w: 128, h: 8, fps: 24.0, secs: 2.0, now, key: 5, seq: (128, 8), pic: moving }
+}
+
+#[test]
+fn motion_extract_reads_the_past_through_the_clip_environment() {
+    let env = bar_env(0.5);
+    let now = env.render(0.5, 1.0);
+    let run_at = |e: &EffectInstance| {
+        let mut o = now.clone();
+        crate::effects::apply(&mut o, e, &FxCtx { seconds: 0.5, env: Some(&env), ..cx() });
+        o
+    };
+    let value = |o: &Image, x: usize| enc_px(o, x, 4)[0];
+    // Delay 4 frames at 24 fps = 1/6 s: the bar is at x = 50 now and was at x = 33
+    let e = inst("motion_extract");
+    let o = run_at(&e);
+    assert!(close(value(&o, 50), 1.0, 1e-4) && close(value(&o, 33), 0.0, 1e-4), "{} {}", value(&o, 50), value(&o, 33));
+    assert!(close(value(&o, 5), 0.5, 1e-4) && close(value(&o, 100), 0.5, 1e-4));
+    // Delay 8 frames: it was at x = 17
+    let mut e8 = e.clone();
+    setf(&mut e8, "delay_frames", 8.0);
+    let o = run_at(&e8);
+    assert!(close(value(&o, 17), 0.0, 1e-4) && close(value(&o, 33), 0.5, 1e-4) && close(value(&o, 50), 1.0, 1e-4));
+    // Reveal, picture fully dimmed: white at both places
+    let mut er = e.clone();
+    set(&mut er, "mode", ParamValue::Choice(1));
+    setf(&mut er, "base_dim", 1.0);
+    let o = run_at(&er);
+    assert!(close(value(&o, 50), 1.0, 1e-4) && close(value(&o, 33), 1.0, 1e-4) && close(value(&o, 5), 0.0, 1e-4));
+    // Without an environment (adjustment layers, isolated use) the picture is left alone
+    let mut o = now.clone();
+    crate::effects::apply(&mut o, &e, &cx());
+    assert_eq!(o.px, now.px);
+    // A disabled effect does nothing
+    let mut off = e.clone();
+    off.enabled = false;
+    assert_eq!(run_at(&off).px, now.px);
+    assert!(is_temporal("motion_extract"));
+}
+
+#[test]
+fn motion_extract_survives_hostile_parameters() {
+    let env = bar_env(0.5);
+    let now = env.render(0.5, 1.0);
+    let check = |e: &EffectInstance, what: String| {
+        let mut o = now.clone();
+        crate::effects::apply(&mut o, e, &FxCtx { seconds: 0.5, env: Some(&env), ..cx() });
+        assert!(o.px.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0 + 1e-4), "{what}");
+    };
+    for id in ["delay_frames", "gain", "black_level", "base_dim"] {
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -5.0, 1e30] {
+            for mode in 0..2 {
+                let mut e = inst("motion_extract");
+                setf(&mut e, id, v);
+                set(&mut e, "mode", ParamValue::Choice(mode));
+                check(&e, format!("{id}={v} mode {mode}"));
+            }
+        }
+    }
+    for (mode, palette) in [(99, 0), (0, 99), (1, 99), (u32::MAX, u32::MAX)] {
+        let mut e = inst("motion_extract");
+        set(&mut e, "mode", ParamValue::Choice(mode));
+        set(&mut e, "palette", ParamValue::Choice(palette));
+        check(&e, format!("mode {mode} palette {palette}"));
+    }
+}
+
 // ------------------------------------------------------------------ through the compositor
 
 mod pipeline {
@@ -1152,5 +1398,40 @@ mod pipeline {
         place(&mut p2, seq2, 0, ocean2, vec![echo]);
         let e = render_sequence(&p2, seq2, r.tick_of(30), RenderOptions::default(), &map2);
         assert!(e.px.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn motion_extract_renders_through_the_sequence() {
+        let r = FrameRate::FPS_24;
+        let size = || SequenceSettings { width: 64, height: 36, frame_rate: r, ..Default::default() };
+        // a still picture is mid-grey, also on the frames that have fewer than 4 frames behind them
+        let mut p = Project::new("mx-still");
+        let mut map = SourceMap::default();
+        let matte = add(&mut p, &mut map, GeneratorSource::new(Generator::ColorMatte { color: [0.2, 0.5, 0.8, 1.0] }, 64, 36, r, Tick(10 * TICKS_PER_SECOND)));
+        let seq = p.new_sequence("s", size(), 1, 0, None);
+        place(&mut p, seq, 0, matte, vec![inst("motion_extract")]);
+        for frame in [0, 2, 30] {
+            let img = render_sequence(&p, seq, r.tick_of(frame), RenderOptions::default(), &map);
+            for y in 0..img.h {
+                for x in 0..img.w {
+                    let c = enc_px(&img, x, y);
+                    assert!(c[..3].iter().all(|v| close(*v, 0.5, 2e-3)), "frame {frame} ({x},{y}) {c:?}");
+                }
+            }
+        }
+        // a moving picture is not: the plasma differs from its plain frame and strays from mid-grey
+        let mut p2 = Project::new("mx-plasma");
+        let mut map2 = SourceMap::default();
+        let plasma = add(&mut p2, &mut map2, GeneratorSource::demo(DemoScene::Plasma));
+        let seq2 = p2.new_sequence("s", size(), 1, 0, None);
+        let mut fx = inst("motion_extract");
+        setf(&mut fx, "delay_frames", 12.0);
+        place(&mut p2, seq2, 0, plasma, vec![fx]);
+        let with = render_sequence(&p2, seq2, r.tick_of(30), RenderOptions::default(), &map2);
+        let plain = render_sequence(&p2, seq2, r.tick_of(30), RenderOptions { effects: false, ..Default::default() }, &map2);
+        assert!(with.px.iter().all(|v| v.is_finite()));
+        assert!(max_diff(&with, &plain) > 0.05, "the effect changes the picture");
+        let spread = (0..with.h).flat_map(|y| (0..with.w).map(move |x| (x, y))).map(|(x, y)| (enc_px(&with, x, y)[1] - 0.5).abs()).fold(0.0f32, f32::max);
+        assert!(spread > 0.02, "the plasma moved in half a second: {spread}");
     }
 }

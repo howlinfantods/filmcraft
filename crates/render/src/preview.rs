@@ -398,6 +398,7 @@ pub fn effect_cost_ms(id: &str) -> f64 {
         | "warp_stabilizer"
         | "auto_reframe"
         | "echo"
+        | "motion_extract"
         | "echo_glow"
         | "glint"
         | "wonder_glow"

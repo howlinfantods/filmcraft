@@ -25,6 +25,10 @@ pub const FRAME_LAYOUTS: &[&str] = &["Monoscopic", "Stereoscopic - Over/Under", 
 pub const EASINGS: &[&str] = &["Linear", "Ease In", "Ease Out", "Ease In and Out"];
 pub const ECHO_OPERATORS: &[&str] = &["Add", "Maximum", "Minimum", "Screen", "Composite In Back", "Composite In Front", "Blend"];
 pub const SIMPLE_BLEND: &[&str] = &["Normal", "Add", "Screen", "Multiply", "Overlay"];
+/// Motion Extract looks: the Posy invert-blend, or the size of the change through a colour ramp.
+const MOTION_EXTRACT_MODES: &[&str] = &["Classic", "Reveal"];
+/// Motion Extract palettes: a neutral ramp and three pastel ramps (Sorbet, Lagoon, Peach fuzz).
+const MOTION_EXTRACT_PALETTES: &[&str] = &["Mono", "Pastel 1", "Pastel 2", "Pastel 3"];
 
 const LIGHT_TYPES: &[&str] = &["None", "Directional", "Omni", "Spotlight"];
 /// Per-light parameter ids of Lighting Effects: (type, color, center, major, minor, angle, intensity, focus).
@@ -626,6 +630,20 @@ pub(super) fn defs() -> Vec<EffectDef> {
         ),
         // ---- Time ----
         video("posterize_time", "Posterize Time", TIME, vec![fs("rate", "Frame Rate", 12.0, (0.1, 99.0), (1.0, 60.0), "", 2)]),
+        // Not on Premiere's list (see `ADDITIONS` in the catalogue test); CPU only, so no accelerated badge.
+        video(
+            "motion_extract",
+            "Motion Extract",
+            TIME,
+            vec![
+                fs("delay_frames", "Delay (frames)", 4.0, (1.0, 60.0), (1.0, 60.0), "", 0),
+                ch("mode", "Mode", MOTION_EXTRACT_MODES, 0),
+                fs("gain", "Gain", 1.0, (0.1, 8.0), (0.1, 8.0), "", 2),
+                fs("black_level", "Black Level", 0.0, (0.0, 0.5), (0.0, 0.5), "", 3),
+                ch("palette", "Palette", MOTION_EXTRACT_PALETTES, 0),
+                fs("base_dim", "Base Dimming", 0.85, (0.0, 1.0), (0.0, 1.0), "", 2),
+            ],
+        ),
         // ---- Transform ----
         video(
             "rotate_3d",
@@ -1152,7 +1170,7 @@ pub(super) fn apply_badges(v: &mut [EffectDef]) {
         let accel = match e.category.first().copied() {
             Some("Legacy") => !matches!(id, "camera_blur"),
             _ if folder == "Obsolete" => false,
-            _ => !matches!(id, "clone" | "stroke"),
+            _ => !matches!(id, "clone" | "stroke" | "motion_extract"),
         };
         e.accelerated = accel;
         e.float32 = a32;
@@ -1229,6 +1247,10 @@ mod tests {
         ("Video", &["Metadata & Timecode Burn-in"]),
     ];
 
+    /// FilmCraft's own additions to the Video Effects bin: not on Premiere's list, so not in
+    /// `CATALOGUE` (whose count is Premiere's 93), but allowed in its folders.
+    const ADDITIONS: &[(&str, &[&str])] = &[("Time", &["Motion Extract"])];
+
     const LEGACY_NAMES: &[&str] = &[
         "Alpha Glow",
         "Block Dissolve",
@@ -1267,8 +1289,15 @@ mod tests {
             if f == "Obsolete" {
                 continue;
             }
-            let listed = CATALOGUE.iter().any(|(cf, names)| *cf == f && names.contains(&d.name));
-            assert!(listed, "{} in {f} is not in Premiere's list", d.name);
+            let listed = CATALOGUE.iter().chain(ADDITIONS).any(|(cf, names)| *cf == f && names.contains(&d.name));
+            assert!(listed, "{} in {f} is not in Premiere's list or FilmCraft's additions", d.name);
+        }
+        for (folder, names) in ADDITIONS {
+            for name in *names {
+                let d = find_effect_by_name(name).unwrap_or_else(|| panic!("missing addition {name}"));
+                assert_eq!(d.category, &["Video Effects", *folder], "{name} folder");
+                assert!(!d.accelerated, "{name} is CPU only");
+            }
         }
         for name in LEGACY_NAMES {
             let d = find_effect_by_name(name).unwrap_or_else(|| panic!("missing legacy {name}"));

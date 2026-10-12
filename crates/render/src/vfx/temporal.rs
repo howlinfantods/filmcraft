@@ -1,4 +1,4 @@
-//! Effects that look at other frames: Posterize Time, Echo, Auto Reframe and Warp Stabilizer.
+//! Effects that look at other frames: Posterize Time, Echo, Motion Extract, Auto Reframe and Warp Stabilizer.
 //!
 //! Warp Stabilizer is a 2-D (similarity / translation) stabilizer: on first use it analyses the
 //! clip — every frame decoded small, Shi–Tomasi features tracked frame to frame with pyramidal
@@ -107,6 +107,147 @@ pub(crate) fn combine_echoes(layers: &[(Image, f32)], op: u32) -> Image {
         o.copy_from_slice(&acc.map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }));
     });
     out
+}
+
+// ------------------------------------------------------------------ Motion Extract
+
+/// How Motion Extract shows the change between now and `Delay (frames)` ago.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtractMode {
+    /// The Posy invert-blend: `0.5 * (now + (1 - delayed))`, mid-grey where nothing moved.
+    Classic,
+    /// The size of the change, `|Y(now) - Y(delayed)|`, through a colour ramp over a dimmed copy of now.
+    Reveal,
+}
+
+/// Motion Extract's parameters, read once per frame and kept finite and in range.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExtractParams {
+    /// Whole frames back (1..=60).
+    pub delay: u32,
+    pub mode: ExtractMode,
+    /// Multiplies the change (0.1..=8).
+    pub gain: f32,
+    /// Changes smaller than this (0..=0.5, display-encoded 0..1 units) count as no motion.
+    pub black: f32,
+    /// 0 = Mono, 1..=3 = Pastel 1..3.
+    pub palette: u32,
+    /// Reveal only: how far the picture under the motion is dimmed (0..=1).
+    pub base_dim: f32,
+}
+
+impl ExtractParams {
+    fn read(e: &EffectInstance, cx: &FxCtx) -> Self {
+        // Parameters come from project files and keyframes: keep every one finite and in range.
+        let num = |id: &str, def: f32, lo: f32, hi: f32| {
+            let v = fv(e, id, cx);
+            if v.is_finite() { v.clamp(lo, hi) } else { def }
+        };
+        Self {
+            delay: num("delay_frames", 4.0, 1.0, 60.0).round() as u32,
+            mode: if chv(e, "mode") == 1 { ExtractMode::Reveal } else { ExtractMode::Classic },
+            gain: num("gain", 1.0, 0.1, 8.0),
+            black: num("black_level", 0.0, 0.0, 0.5),
+            palette: chv(e, "palette").min(3),
+            base_dim: num("base_dim", 0.85, 0.0, 1.0),
+        }
+    }
+}
+
+/// The Mono ramp of MotionScope (`ColorRampLibrary` "Mono"): black, a cool grey at 0.45, white.
+const MONO_RAMP: [(f32, [f32; 3]); 3] = [(0.0, [0.0, 0.0, 0.0]), (0.45, [0.55, 0.57, 0.62]), (1.0, [1.0, 1.0, 1.0])];
+
+/// The pastel ramps of the grid demo (`PALS`): five equally spaced sRGB stops, a dusty dark at 0 up
+/// to near-cream at 1. Pastel 1 = Sorbet, Pastel 2 = Lagoon, Pastel 3 = Peach fuzz.
+const PASTEL_RAMPS: [[u32; 5]; 3] = [
+    [0x2c2745, 0x6d5fa8, 0xe49bc4, 0xffc9a8, 0xfff5cf],
+    [0x17323f, 0x3c8793, 0x86d3bf, 0xcdeeb0, 0xfff7d8],
+    [0x3a2c3b, 0x9b5f8e, 0xf09aa0, 0xffd09a, 0xfffae8],
+];
+
+fn hex_rgb(h: u32) -> [f32; 3] {
+    [((h >> 16) & 0xff) as f32 / 255.0, ((h >> 8) & 0xff) as f32 / 255.0, (h & 0xff) as f32 / 255.0]
+}
+
+/// The sRGB-encoded ramp colour at `t` (0..1) of palette 0 = Mono, 1..=3 = Pastel 1..3.
+pub(crate) fn ramp_color(palette: u32, t: f32) -> [f32; 3] {
+    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+    match palette {
+        1..=3 => {
+            let stops = &PASTEL_RAMPS[palette as usize - 1];
+            let u = t * (stops.len() - 1) as f32;
+            let k = (u as usize).min(stops.len() - 2);
+            lerp3(hex_rgb(stops[k]), hex_rgb(stops[k + 1]), u - k as f32)
+        }
+        _ => {
+            let k = usize::from(t > MONO_RAMP[1].0);
+            let (a, b) = (MONO_RAMP[k], MONO_RAMP[k + 1]);
+            lerp3(a.1, b.1, (t - a.0) / (b.0 - a.0))
+        }
+    }
+}
+
+/// The dead zone: `x` pulled towards zero by `black` (sign kept) and stretched so a full-scale change stays 1.
+#[inline]
+fn gate(x: f32, black: f32) -> f32 {
+    ((x.abs() - black).max(0.0) / (1.0 - black)).copysign(x)
+}
+
+/// Reveal's amount (0..1) for a luma change `diff`: dead zone, gain, clip.
+pub(crate) fn motion_amount(diff: f32, p: &ExtractParams) -> f32 {
+    (gate(diff.abs(), p.black) * p.gain).clamp(0.0, 1.0)
+}
+
+/// Display-encoded straight colour (0..1) of a premultiplied linear pixel.
+#[inline]
+fn encoded(px: &[f32; 4]) -> [f32; 3] {
+    enc(Image::unpremul(*px)).map(|v| v.min(1.0))
+}
+
+/// Motion Extract on `img` (now) against `past`. Without a past frame, or one of another size,
+/// nothing moved: Classic gives mid-grey, Reveal the dimmed picture. Output alpha is the current
+/// alpha. The maths runs on display-encoded colour (see [`ExtractMode`]).
+pub(crate) fn extract_motion(img: &mut Image, past: Option<&Image>, p: &ExtractParams) {
+    let w = img.w;
+    if w == 0 || img.h == 0 {
+        return;
+    }
+    let past = past.filter(|f| f.w == img.w && f.h == img.h);
+    let keep = 1.0 - p.base_dim;
+    img.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        for (x, o) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let now = encoded(o);
+            let before = past.map_or(now, |f| encoded(&f.px.as_chunks::<4>().0[y * w + x]));
+            let out = match p.mode {
+                ExtractMode::Classic => {
+                    let blend = [0, 1, 2].map(|k| (0.5 + 0.5 * p.gain * gate(now[k] - before[k], p.black)).clamp(0.0, 1.0));
+                    if p.palette == 0 { blend } else { ramp_color(p.palette, luma(blend)) }
+                }
+                ExtractMode::Reveal => {
+                    let m = motion_amount(luma(now) - luma(before), p);
+                    lerp3(now.map(|v| v * keep), ramp_color(p.palette, m), m)
+                }
+            };
+            let lin = dec(out);
+            let a = o[3];
+            o[..3].copy_from_slice(&[lin[0] * a, lin[1] * a, lin[2] * a]);
+        }
+    });
+}
+
+/// Motion Extract: Posy-style motion extraction. The clip is compared with its own picture
+/// `Delay (frames)` sequence frames earlier (the effects before this one applied to both), so what
+/// stays put cancels out and what moved shows. Classic is the invert-blend; Reveal colours the size
+/// of the change over a dimmed copy of the picture. CPU only: a past frame is fetched through
+/// [`FxEnv::frame`], so without an environment (adjustment layers, isolated tests) the image is
+/// left unchanged. Where the clip has no picture that far back, the past is taken to be the present.
+pub fn motion_extract(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
+    let Some(env) = cx.env else { return };
+    let p = ExtractParams::read(e, cx);
+    let fps = env.frame_rate();
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { 24.0 };
+    let past = env.frame(-f64::from(p.delay) / fps, e);
+    extract_motion(img, past.as_ref(), &p);
 }
 
 // ------------------------------------------------------------------ analysis helpers
