@@ -116,7 +116,8 @@ pub(crate) fn combine_echoes(layers: &[(Image, f32)], op: u32) -> Image {
 pub(crate) enum ExtractMode {
     /// The Posy invert-blend: `0.5 * (now + (1 - delayed))`, mid-grey where nothing moved.
     Classic,
-    /// The size of the change, `|Y(now) - Y(delayed)|`, through a colour ramp over a dimmed copy of now.
+    /// The size of the change, `|Y(now) - Y(delayed)|`, normalised by the frame's white point and shaped by
+    /// gamma and a smoothstep knee, through a colour ramp over a dimmed copy of now.
     Reveal,
 }
 
@@ -134,10 +135,16 @@ pub(crate) struct ExtractParams {
     pub palette: u32,
     /// Reveal only: how far the picture under the motion is dimmed (0..=1).
     pub base_dim: f32,
+    /// Reveal only: gamma on the normalised change (0.3..=2); below 1 lifts faint motion. 1 = off.
+    pub gamma: f32,
+    /// Reveal only: upper edge of a smoothstep on the normalised change (0..=1); 0 = off.
+    pub knee: f32,
+    /// Reveal only: divide the change by the frame's own white point ([`auto_white_point`]).
+    pub auto_white: bool,
 }
 
 impl ExtractParams {
-    fn read(e: &EffectInstance, cx: &FxCtx) -> Self {
+    pub(crate) fn read(e: &EffectInstance, cx: &FxCtx) -> Self {
         // Parameters come from project files and keyframes: keep every one finite and in range.
         let num = |id: &str, def: f32, lo: f32, hi: f32| {
             let v = fv(e, id, cx);
@@ -150,6 +157,9 @@ impl ExtractParams {
             black: num("black_level", 0.0, 0.0, 0.5),
             palette: chv(e, "palette").min(3),
             base_dim: num("base_dim", 0.85, 0.0, 1.0),
+            gamma: num("gamma", 0.6, 0.3, 2.0),
+            knee: num("knee", 0.15, 0.0, 1.0),
+            auto_white: bv(e, "auto_white"),
         }
     }
 }
@@ -193,9 +203,101 @@ fn gate(x: f32, black: f32) -> f32 {
     ((x.abs() - black).max(0.0) / (1.0 - black)).copysign(x)
 }
 
-/// Reveal's amount (0..1) for a luma change `diff`: dead zone, gain, clip.
+/// Auto white: the share of pixels allowed above the white point (so the 99.5th percentile).
+const WHITE_TAIL: f64 = 0.005;
+/// Auto white: the smallest white point, in changed-luma units (about 5 levels of 8-bit video). A
+/// still scene (identical frames, rounding noise) therefore is never stretched by more than 1 / 0.02.
+pub(crate) const WHITE_FLOOR: f32 = 0.02;
+/// Auto white: histogram bins, uniform in sqrt(change) so faint changes get the fine bins.
+const WHITE_BINS: usize = 2048;
+/// The smallest knee that is not "off" (MotionScope clamps its `kneeStart` to at least 0.05).
+const KNEE_MIN: f32 = 0.05;
+
+/// Reveal's amount (0..1) for a gated change `g` (>= 0) against the white point `white`:
+/// `gain * (g / white)^gamma` clipped to 0..1, then the knee `smoothstep(0, knee, x)`. White 1, gamma 1
+/// and knee 0 skip their steps, which leaves the earlier `clamp(gain * g)` bit for bit.
+#[inline]
+pub(crate) fn shape(g: f32, white: f32, p: &ExtractParams) -> f32 {
+    let mut x = g;
+    if white != 1.0 {
+        x /= white;
+    }
+    if p.gamma != 1.0 {
+        x = x.powf(p.gamma);
+    }
+    let x = (x * p.gain).clamp(0.0, 1.0);
+    if p.knee > 0.0 { smoothstep(0.0, p.knee.max(KNEE_MIN), x) } else { x }
+}
+
+/// Reveal's amount (0..1) for a luma change `diff` at white point 1: dead zone, gain, gamma, knee.
+/// The renderer goes through [`reveal_amounts`]; this one-pixel form is for the tests.
+#[cfg(test)]
 pub(crate) fn motion_amount(diff: f32, p: &ExtractParams) -> f32 {
-    (gate(diff.abs(), p.black) * p.gain).clamp(0.0, 1.0)
+    shape(gate(diff.abs(), p.black), 1.0, p)
+}
+
+/// The auto white point of a frame's gated changes `g`: `max(WHITE_FLOOR, P99.5(g))`, where P99.5 is
+/// the value the top 0.5 % of the pixels (rounded up, at least one) reach, read from a histogram of
+/// `sqrt(g)` in 2048 bins with linear interpolation inside the bin.
+pub(crate) fn auto_white_point(g: &[f32]) -> f32 {
+    if g.is_empty() {
+        return WHITE_FLOOR;
+    }
+    let bin = |v: f32| ((v.max(0.0).sqrt() * WHITE_BINS as f32) as usize).min(WHITE_BINS - 1);
+    let hist = g
+        .par_chunks(1 << 15)
+        .fold(
+            || vec![0u32; WHITE_BINS],
+            |mut h, chunk| {
+                for &v in chunk {
+                    h[bin(v)] += 1;
+                }
+                h
+            },
+        )
+        .reduce(
+            || vec![0u32; WHITE_BINS],
+            |mut a, b| {
+                a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
+                a
+            },
+        );
+    let k = ((g.len() as f64 * WHITE_TAIL).ceil() as u64).max(1);
+    let mut above = 0u64;
+    for (b, &count) in hist.iter().enumerate().rev() {
+        let c = u64::from(count);
+        if above + c >= k {
+            let edge = |i: usize| (i as f32 / WHITE_BINS as f32).powi(2);
+            let (lo, hi) = (edge(b), edge(b + 1));
+            let rank = (k - above) as f32; // 1 = the largest in this bin
+            return (hi - (hi - lo) * (rank - 0.5) / c as f32).max(WHITE_FLOOR);
+        }
+        above += c;
+    }
+    WHITE_FLOOR
+}
+
+/// Reveal's amount (0..1) of every pixel of `now` against `past`, row-major: the dead-zoned luma
+/// change, divided by the frame's white point when `auto_white` is on, then gain, gamma and knee.
+/// Without a past frame (or one of another size) nothing moved.
+pub(crate) fn reveal_amounts(now: &Image, past: Option<&Image>, p: &ExtractParams) -> Vec<f32> {
+    let w = now.w;
+    let mut amount = vec![0.0f32; w * now.h];
+    if amount.is_empty() {
+        return amount;
+    }
+    let past = past.filter(|f| f.w == now.w && f.h == now.h);
+    amount.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let n = &now.px.as_chunks::<4>().0[y * w..(y + 1) * w];
+        for (x, o) in row.iter_mut().enumerate() {
+            let a = luma(encoded(&n[x]));
+            let b = past.map_or(a, |f| luma(encoded(&f.px.as_chunks::<4>().0[y * w + x])));
+            *o = gate((a - b).abs(), p.black);
+        }
+    });
+    let white = if p.auto_white { auto_white_point(&amount) } else { 1.0 };
+    amount.par_iter_mut().for_each(|g| *g = shape(*g, white, p));
+    amount
 }
 
 /// Display-encoded straight colour (0..1) of a premultiplied linear pixel.
@@ -212,19 +314,21 @@ pub(crate) fn extract_motion(img: &mut Image, past: Option<&Image>, p: &ExtractP
     if w == 0 || img.h == 0 {
         return;
     }
+    // Reveal needs the whole frame's changes before it can normalise them (auto white)
+    let amounts = if p.mode == ExtractMode::Reveal { reveal_amounts(img, past, p) } else { Vec::new() };
     let past = past.filter(|f| f.w == img.w && f.h == img.h);
     let keep = 1.0 - p.base_dim;
     img.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
         for (x, o) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let now = encoded(o);
-            let before = past.map_or(now, |f| encoded(&f.px.as_chunks::<4>().0[y * w + x]));
             let out = match p.mode {
                 ExtractMode::Classic => {
+                    let before = past.map_or(now, |f| encoded(&f.px.as_chunks::<4>().0[y * w + x]));
                     let blend = [0, 1, 2].map(|k| (0.5 + 0.5 * p.gain * gate(now[k] - before[k], p.black)).clamp(0.0, 1.0));
                     if p.palette == 0 { blend } else { ramp_color(p.palette, luma(blend)) }
                 }
                 ExtractMode::Reveal => {
-                    let m = motion_amount(luma(now) - luma(before), p);
+                    let m = amounts[y * w + x];
                     lerp3(now.map(|v| v * keep), ramp_color(p.palette, m), m)
                 }
             };
@@ -238,7 +342,8 @@ pub(crate) fn extract_motion(img: &mut Image, past: Option<&Image>, p: &ExtractP
 /// Motion Extract: Posy-style motion extraction. The clip is compared with its own picture
 /// `Delay (frames)` sequence frames earlier (the effects before this one applied to both), so what
 /// stays put cancels out and what moved shows. Classic is the invert-blend; Reveal colours the size
-/// of the change over a dimmed copy of the picture. CPU only: a past frame is fetched through
+/// of the change (auto white point, gamma and knee first, so faint motion spans the ramp) over a
+/// dimmed copy of the picture. CPU only: a past frame is fetched through
 /// [`FxEnv::frame`], so without an environment (adjustment layers, isolated tests) the image is
 /// left unchanged. Where the clip has no picture that far back, the past is taken to be the present.
 pub fn motion_extract(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {

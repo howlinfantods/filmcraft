@@ -1074,8 +1074,9 @@ fn auto_reframe_follows_the_subject() {
 
 use temporal::{ExtractMode, ExtractParams};
 
+/// The settings that reproduce the first Reveal exactly: no gamma, no knee, no auto white.
 fn mx(mode: ExtractMode) -> ExtractParams {
-    ExtractParams { delay: 4, mode, gain: 1.0, black: 0.0, palette: 0, base_dim: 0.85 }
+    ExtractParams { delay: 4, mode, gain: 1.0, black: 0.0, palette: 0, base_dim: 0.85, gamma: 1.0, knee: 0.0, auto_white: false }
 }
 
 /// `w`×`h` black with hard-edged discs `(centre x, centre y, radius, display-encoded value)`.
@@ -1297,7 +1298,7 @@ fn motion_extract_survives_hostile_parameters() {
         crate::effects::apply(&mut o, e, &FxCtx { seconds: 0.5, env: Some(&env), ..cx() });
         assert!(o.px.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0 + 1e-4), "{what}");
     };
-    for id in ["delay_frames", "gain", "black_level", "base_dim"] {
+    for id in ["delay_frames", "gain", "black_level", "base_dim", "knee", "gamma"] {
         for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -5.0, 1e30] {
             for mode in 0..2 {
                 let mut e = inst("motion_extract");
@@ -1312,6 +1313,209 @@ fn motion_extract_survives_hostile_parameters() {
         set(&mut e, "mode", ParamValue::Choice(mode));
         set(&mut e, "palette", ParamValue::Choice(palette));
         check(&e, format!("mode {mode} palette {palette}"));
+    }
+    for auto in [false, true] {
+        let mut e = inst("motion_extract");
+        set(&mut e, "mode", ParamValue::Choice(1));
+        set(&mut e, "auto_white", ParamValue::Bool(auto));
+        check(&e, format!("auto_white {auto}"));
+    }
+}
+
+// ---- Reveal: knee, gamma and auto white
+
+/// The Reveal code as it was before knee, gamma and auto white, kept here as the reference for the
+/// bit-exact test.
+fn reveal_before_knee(now: &Image, past: &Image, p: &ExtractParams) -> Image {
+    let enc_of = |q: &[f32; 4]| enc(Image::unpremul(*q)).map(|v| v.min(1.0));
+    let gate = |x: f32| ((x.abs() - p.black).max(0.0) / (1.0 - p.black)).copysign(x);
+    let keep = 1.0 - p.base_dim;
+    let mut img = now.clone();
+    for (o, q) in img.px.as_chunks_mut::<4>().0.iter_mut().zip(past.px.as_chunks::<4>().0) {
+        let (n, b) = (enc_of(o), enc_of(q));
+        let m = (gate((luma(n) - luma(b)).abs()) * p.gain).clamp(0.0, 1.0);
+        let out = lerp3(n.map(|v| v * keep), temporal::ramp_color(p.palette, m), m);
+        let lin = dec(out);
+        let a = o[3];
+        o[..3].copy_from_slice(&[lin[0] * a, lin[1] * a, lin[2] * a]);
+    }
+    img
+}
+
+/// `img` with every row rotated right by `dx` pixels.
+fn rolled(img: &Image, dx: usize) -> Image {
+    let mut o = img.clone();
+    for row in o.px.chunks_mut(img.w * 4) {
+        row.rotate_right(dx * 4);
+    }
+    o
+}
+
+/// `w`x`h` black with a Gaussian blob of display-encoded peak `amp` centred at `(cx, cy)` (pixel-centre units).
+fn blob(w: usize, h: usize, (cx, cy): (f32, f32), sigma: f32, amp: f32) -> Image {
+    let mut img = Image::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+            let l = dec([amp * (-(dx * dx + dy * dy) / (2.0 * sigma * sigma)).exp(); 3]);
+            img.px[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[l[0], l[1], l[2], 1.0]);
+        }
+    }
+    img
+}
+
+/// The parameters of a fresh Motion Extract effect, in Reveal.
+fn reveal_defaults() -> ExtractParams {
+    ExtractParams { mode: ExtractMode::Reveal, ..ExtractParams::read(&inst("motion_extract"), &cx()) }
+}
+
+#[test]
+fn motion_extract_reveal_defaults_are_knee_05_gamma_06_auto_white_on() {
+    let p = ExtractParams::read(&inst("motion_extract"), &cx());
+    assert_eq!((p.delay, p.mode, p.palette), (4, ExtractMode::Classic, 0));
+    assert_eq!((p.gain, p.black, p.base_dim), (1.0, 0.0, 0.85));
+    assert_eq!((p.knee, p.gamma, p.auto_white), (0.5, 0.6, true));
+}
+
+#[test]
+fn motion_extract_classic_ignores_knee_gamma_and_auto_white() {
+    let (now, past) = (picture(48, 32), rolled(&picture(48, 32), 3));
+    let reference = extract(&now, &past, &mx(ExtractMode::Classic));
+    for (gamma, knee, auto_white) in [(0.6, 0.15, true), (2.0, 1.0, true), (0.3, 0.0, false)] {
+        let o = extract(&now, &past, &ExtractParams { gamma, knee, auto_white, ..mx(ExtractMode::Classic) });
+        assert_eq!(o.px, reference.px, "gamma {gamma} knee {knee} auto {auto_white}");
+    }
+}
+
+#[test]
+fn motion_extract_reveal_without_gamma_knee_and_auto_white_is_bit_identical_to_the_first_version() {
+    let (w, h) = (48, 32);
+    let pairs = [
+        (picture(w, h), rolled(&picture(w, h), 3)),
+        (discs(w, h, &[(30.0, 16.0, 6.0, 0.9), (12.0, 10.0, 5.0, 0.4)]), discs(w, h, &[(26.0, 16.0, 6.0, 0.9), (12.0, 14.0, 5.0, 0.4)])),
+        (picture(w, h), picture(w, h)),
+    ];
+    let mut compared = 0;
+    for (now, past) in &pairs {
+        for gain in [0.5, 1.0, 3.0, 8.0] {
+            for black in [0.0, 0.05, 0.2] {
+                for palette in 0..=3 {
+                    for base_dim in [0.0, 0.85, 1.0] {
+                        let p = ExtractParams { gain, black, palette, base_dim, ..mx(ExtractMode::Reveal) };
+                        let (new, old) = (extract(now, past, &p), reveal_before_knee(now, past, &p));
+                        assert!(
+                            new.px.iter().map(|v| v.to_bits()).eq(old.px.iter().map(|v| v.to_bits())),
+                            "gain {gain} black {black} palette {palette} dim {base_dim}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 3 * 4 * 3 * 4 * 3);
+}
+
+#[test]
+fn motion_extract_reveal_defaults_make_a_faint_drifting_blob_visible() {
+    // amplitude 0.05 of full scale, sigma 10 px, drifting 1 px per frame: the frame 4 back (the default delay) has it 4 px left
+    let (w, h, delay) = (128, 96, 4);
+    let (centre, shift) = ((70.5, 48.0), delay as f32);
+    let now = blob(w, h, centre, 10.0, 0.05);
+    let past = blob(w, h, (centre.0 - shift, centre.1), 10.0, 0.05);
+    let at = |amounts: &[f32]| amounts[48 * w + 70];
+    let on = temporal::reveal_amounts(&now, Some(&past), &reveal_defaults());
+    let peak = on.iter().copied().fold(0.0, f32::max);
+    assert!(at(&on) >= 0.5 && peak >= 0.5, "defaults: centre {} peak {peak}", at(&on));
+    // the same frames the way the first version showed them, even at the largest gain, stay dark
+    for gain in [1.0, 8.0] {
+        let old = temporal::reveal_amounts(&now, Some(&past), &ExtractParams { gain, ..mx(ExtractMode::Reveal) });
+        let peak = old.iter().copied().fold(0.0, f32::max);
+        assert!(at(&old) < 0.1 && peak < 0.5, "first version, gain {gain}: centre {} peak {peak}", at(&old));
+    }
+    // without the white point gamma and knee alone do not get the centre there
+    let no_white = temporal::reveal_amounts(&now, Some(&past), &ExtractParams { auto_white: false, ..reveal_defaults() });
+    assert!(at(&no_white) < 0.5, "auto white off: centre {}", at(&no_white));
+    // and the colour that comes out is the ramp, not the dim plate: at knee 0.5 the centre is graded, well above the plate
+    let o = extract(&now, &past, &ExtractParams { palette: 1, ..reveal_defaults() });
+    let c = enc_px(&o, 70, 48);
+    assert!(c[0] > 0.6 && c[1] > 0.5, "centre pixel {c:?}");
+}
+
+#[test]
+fn motion_extract_reveal_static_frames_stay_black_with_auto_white() {
+    let (w, h) = (48, 32);
+    let still = picture(w, h);
+    let p = reveal_defaults();
+    // identical frames: every amount is 0 and the fully dimmed output is exactly black
+    assert!(temporal::reveal_amounts(&still, Some(&still), &p).iter().all(|&m| m == 0.0));
+    let o = extract(&still, &still, &ExtractParams { base_dim: 1.0, ..p });
+    assert!(o.px.as_chunks::<4>().0.iter().all(|q| q[..3].iter().all(|v| *v == 0.0) && q[3] == 1.0));
+    // frames that differ by rounding-level noise (1e-6 in display-encoded units): still black, because the floor keeps the white point at 0.02
+    let noisy = {
+        let mut o = still.clone();
+        for (i, q) in o.px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let c = enc(Image::unpremul(*q));
+            let n = if i % 2 == 0 { 1e-6 } else { -1e-6 };
+            let l = dec(c.map(|v| (v + n).clamp(0.0, 1.0)));
+            *q = [l[0], l[1], l[2], 1.0];
+        }
+        o
+    };
+    let amounts = temporal::reveal_amounts(&noisy, Some(&still), &p);
+    let peak = amounts.iter().copied().fold(0.0, f32::max);
+    assert!(peak < 0.01, "noise peak {peak}");
+    // the white point of such frames is the floor itself
+    let g: Vec<f32> = (0..1000).map(|i| (i % 7) as f32 * 1e-6).collect();
+    assert_eq!(temporal::auto_white_point(&g), temporal::WHITE_FLOOR);
+    assert_eq!(temporal::auto_white_point(&[0.0; 64]), temporal::WHITE_FLOOR);
+    assert_eq!(temporal::auto_white_point(&[]), temporal::WHITE_FLOOR);
+}
+
+#[test]
+fn motion_extract_auto_white_point_is_the_99_5th_percentile_with_a_floor() {
+    // a ramp 0..0.4 of 10 000 values: the top 0.5 % (50 values) start at 0.398
+    let ramp: Vec<f32> = (0..10_000).map(|i| i as f32 / 10_000.0 * 0.4).collect();
+    let w = temporal::auto_white_point(&ramp);
+    assert!(close(w, 0.398, 0.004), "{w}");
+    // 0.4 % outliers do not move it, 0.6 % do
+    let mut g = vec![0.03f32; 10_000];
+    g[..40].fill(0.9);
+    assert!(close(temporal::auto_white_point(&g), 0.03, 0.001), "{}", temporal::auto_white_point(&g));
+    g[..60].fill(0.9);
+    assert!(close(temporal::auto_white_point(&g), 0.9, 0.002), "{}", temporal::auto_white_point(&g));
+    // below the floor the floor wins
+    assert_eq!(temporal::auto_white_point(&vec![0.01; 500]), temporal::WHITE_FLOOR);
+    // a 1080p-sized frame of mixed values gives the sorted percentile to within 1 %
+    let mut big: Vec<f32> = (0..1920 * 1080).map(|i| ((i * 2654435761usize) % 100_003) as f32 / 100_003.0 * 0.2).collect();
+    let est = temporal::auto_white_point(&big);
+    big.sort_by(f32::total_cmp);
+    let exact = big[big.len() - (big.len() as f64 * 0.005).ceil() as usize];
+    assert!(close(est, exact, exact * 0.01), "{est} vs {exact}");
+}
+
+#[test]
+fn motion_extract_knee_and_gamma_shape_the_amount() {
+    let base = mx(ExtractMode::Reveal);
+    let shape = |g: f32, white: f32, p: &ExtractParams| temporal::shape(g, white, p);
+    assert_eq!(shape(0.3, 1.0, &base), 0.3, "everything off is the old linear ramp");
+    assert!(close(shape(0.25, 1.0, &ExtractParams { gamma: 0.5, ..base }), 0.5, 1e-6));
+    assert!(close(shape(0.5, 1.0, &ExtractParams { gamma: 2.0, ..base }), 0.25, 1e-6));
+    assert!(close(shape(0.01, 0.02, &base), 0.5, 1e-6), "divided by the white point");
+    assert_eq!(shape(0.25, 1.0, &ExtractParams { gamma: 0.5, gain: 2.0, ..base }), 1.0, "gain after gamma, clipped");
+    let k = ExtractParams { knee: 0.15, ..base };
+    assert_eq!(shape(0.0, 1.0, &k), 0.0);
+    assert!(close(shape(0.075, 1.0, &k), 0.5, 1e-6) && shape(0.15, 1.0, &k) == 1.0 && shape(0.9, 1.0, &k) == 1.0);
+    assert!(close(shape(0.025, 1.0, &ExtractParams { knee: 0.01, ..base }), 0.5, 1e-6), "knees under 0.05 act as 0.05");
+    assert!(
+        close(shape(0.5, 1.0, &ExtractParams { knee: 1.0, ..base }), 0.5, 1e-6) && close(shape(0.25, 1.0, &ExtractParams { knee: 1.0, ..base }), 0.15625, 1e-6)
+    );
+    let d = reveal_defaults();
+    let mut last = 0.0;
+    for i in 0..=1000 {
+        let m = shape(i as f32 / 1000.0, temporal::WHITE_FLOOR, &d);
+        assert!((0.0..=1.0).contains(&m) && m >= last, "not monotone at {i}: {m} after {last}");
+        last = m;
     }
 }
 

@@ -642,6 +642,10 @@ pub(super) fn defs() -> Vec<EffectDef> {
                 fs("black_level", "Black Level", 0.0, (0.0, 0.5), (0.0, 0.5), "", 3),
                 ch("palette", "Palette", MOTION_EXTRACT_PALETTES, 0),
                 fs("base_dim", "Base Dimming", 0.85, (0.0, 1.0), (0.0, 1.0), "", 2),
+                // Reveal only: shape the change before the ramp so faint motion reads (see temporal.rs).
+                fs("knee", "Knee", 0.5, (0.0, 1.0), (0.0, 1.0), "", 2),
+                fs("gamma", "Gamma", 0.6, (0.3, 2.0), (0.3, 2.0), "", 2),
+                b("auto_white", "Auto White", true),
             ],
         ),
         // ---- Transform ----
